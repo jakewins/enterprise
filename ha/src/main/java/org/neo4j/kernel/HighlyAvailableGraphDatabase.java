@@ -217,7 +217,8 @@ public class HighlyAvailableGraphDatabase
         config = new ConfigurationDefaults( GraphDatabaseSettings.class, HaSettings.class, OnlineBackupSettings.class ).apply( configurationMigrator.migrateConfiguration( config ) );
         configuration.applyChanges( config );
 
-        messageLog = logging.getLogger( Loggers.NEO4J );
+        messageLog = createMessageLog();
+        
         fileSystemAbstraction = new DefaultFileSystemAbstraction();
 
         caches = new HaCaches( messageLog );
@@ -261,6 +262,11 @@ public class HighlyAvailableGraphDatabase
         this.clusterClient = createClusterClient();
 
         start();
+    }
+
+    private StringLogger createMessageLog()
+    {
+        return life.add(logging.getLogger( Loggers.NEO4J ));
     }
 
     private Logging createLogging()
