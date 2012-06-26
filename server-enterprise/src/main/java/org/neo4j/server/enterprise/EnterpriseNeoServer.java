@@ -40,7 +40,10 @@ public class EnterpriseNeoServer extends AdvancedNeoServer {
 	protected PreFlightTasks createPreflightTasks() 
     {
 		return new PreFlightTasks(
-				new EnsureEnterpriseNeo4jPropertiesExist(configurator.configuration()),
+				// TODO: This check should be done in the bootrapper,
+				// and verification of config should be done by the new
+				// config system.
+				//new EnsureEnterpriseNeo4jPropertiesExist(configurator.configuration()),
 				new EnsurePreparedForHttpLogging(configurator.configuration()),
 				new PerformUpgradeIfNecessary(getConfiguration(), 
 						configurator.getDatabaseTuningProperties(), System.out),
