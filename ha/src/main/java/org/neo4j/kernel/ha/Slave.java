@@ -17,11 +17,13 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
-package org.neo4j.com;
+package org.neo4j.kernel.ha;
 
-import org.jboss.netty.buffer.ChannelBuffer;
+import org.neo4j.com.Response;
 
-public interface MasterCaller<M, R>
+public interface Slave
 {
-    Response<R> callMaster( M master, SlaveContext context, ChannelBuffer input, ChannelBuffer target );
+    Response<Void> pullUpdates( String resource, long upToAndIncludingTxId );
+    
+    int getServerId();
 }

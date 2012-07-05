@@ -36,9 +36,13 @@ import java.net.UnknownHostException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -61,12 +65,18 @@ import org.neo4j.kernel.HaConfig;
 import org.neo4j.kernel.InformativeStackTrace;
 import org.neo4j.kernel.SlaveUpdateMode;
 import org.neo4j.kernel.configuration.Config;
+import org.neo4j.kernel.ha.Broker;
 import org.neo4j.kernel.ha.ClusterEventReceiver;
 import org.neo4j.kernel.ha.ConnectionInformation;
 import org.neo4j.kernel.ha.HaSettings;
+import org.neo4j.kernel.ha.MasterClientFactory;
 import org.neo4j.kernel.ha.MasterImpl;
 import org.neo4j.kernel.ha.MasterServer;
+import org.neo4j.kernel.ha.Slave;
+import org.neo4j.kernel.ha.SlaveClient;
 import org.neo4j.kernel.ha.SlaveDatabaseOperations;
+import org.neo4j.kernel.ha.SlaveImpl;
+import org.neo4j.kernel.ha.SlaveServer;
 import org.neo4j.kernel.impl.nioneo.store.StoreId;
 import org.neo4j.kernel.impl.transaction.xaframework.LogExtractor;
 import org.neo4j.kernel.impl.transaction.xaframework.NullLogBuffer;
@@ -91,6 +101,7 @@ public class ZooClient extends AbstractZooKeeperManager
     private volatile boolean flushing = false;
     private String rootPath;
     private volatile StoreId storeId;
+    private volatile TxIdUpdater updater = new NoUpdateTxIdUpdater();
 
     // Has the format <host-name>:<port>
     private final String haServer;
@@ -106,14 +117,15 @@ public class ZooClient extends AbstractZooKeeperManager
     private final boolean allowCreateCluster;
     private final WatcherImpl watcher;
 
-    public ZooClient( String storeDir, StringLogger stringLogger, Config conf,
-            SlaveDatabaseOperations localDatabase, ClusterEventReceiver clusterReceiver )
+    private final Machine asMachine;
+
+    private final Map<Integer, Pair<SlaveClient,Machine>> cachedSlaves = new HashMap<Integer, Pair<SlaveClient,Machine>>();
+    private volatile boolean serversRefreshed = true;
+
+    public ZooClient( String storeDir, StringLogger stringLogger, Config conf, SlaveDatabaseOperations localDatabase,
+            ClusterEventReceiver clusterReceiver, MasterClientFactory clientFactory )
     {
-        super( conf.get( HaSettings.coordinators ), stringLogger,
-            conf.getInteger( read_timeout ),
-            conf.isSet( lock_read_timeout ) ? conf.getInteger( lock_read_timeout) : conf.getInteger( read_timeout ),
-            conf.getInteger( max_concurrent_channels_per_slave ),
-            conf.getInteger( zk_session_timeout ));
+        super( conf.get( HaSettings.coordinators ), stringLogger, conf.getInteger( zk_session_timeout ), clientFactory );
         this.storeDir = storeDir;
         this.conf = conf;
         this.localDatabase = localDatabase;
@@ -125,6 +137,7 @@ public class ZooClient extends AbstractZooKeeperManager
         clusterName = conf.get( cluster_name );
         sequenceNr = "not initialized yet";
         allowCreateCluster = conf.getBoolean( allow_init_cluster );
+        asMachine = new Machine( machineId, 0, 0, 0, haServer, backupPort );
 
         try
         {
@@ -168,16 +181,21 @@ public class ZooClient extends AbstractZooKeeperManager
     public Object instantiateMasterServer( GraphDatabaseAPI graphDb )
     {
         int timeOut = conf.isSet( lock_read_timeout ) ? conf.getInteger( lock_read_timeout ) : conf.getInteger( read_timeout );
-        return new MasterServer( new MasterImpl( graphDb, timeOut ),
-                Machine.splitIpAndPort( haServer ).other(), graphDb.getMessageLog(),
-                conf.getInteger( max_concurrent_channels_per_slave ),
-                clientLockReadTimeout, new BranchDetectingTxVerifier( graphDb ) );
+        return new MasterServer( new MasterImpl( graphDb, timeOut ), Machine.splitIpAndPort( haServer ).other(),
+                graphDb.getMessageLog(), conf.getInteger( max_concurrent_channels_per_slave ), timeOut,
+                new BranchDetectingTxVerifier( graphDb ) );
     }
-    
+
     @Override
     protected StoreId getStoreId()
     {
         return storeId;
+    }
+
+    public Object instantiateSlaveServer( GraphDatabaseAPI graphDb, Broker broker, SlaveDatabaseOperations ops )
+    {
+        return new SlaveServer( new SlaveImpl( graphDb, broker, ops ), Machine.splitIpAndPort( haServer ).other(),
+                graphDb.getMessageLog() );
     }
 
     @Override
@@ -264,6 +282,24 @@ public class ZooClient extends AbstractZooKeeperManager
                 }
                 else throw new ZooKeeperException( "Couldn't get or create " + child, e );
             }
+        }
+        catch ( InterruptedException e )
+        {
+            Thread.interrupted();
+            throw new ZooKeeperException( "Interrupted", e );
+        }
+    }
+
+    protected void subscribeToChildrenChangeWatcher( String child )
+    {
+        String path = getRoot() + "/" + child;
+        try
+        {
+            zooKeeper.getChildren( path, true );
+        }
+        catch ( KeeperException e )
+        {
+            throw new ZooKeeperException( "Couldn't subscribe getChildren at " + path, e );
         }
         catch ( InterruptedException e )
         {
@@ -468,6 +504,7 @@ public class ZooClient extends AbstractZooKeeperManager
             // Add watches to our master notification nodes
             subscribeToDataChangeWatcher( MASTER_NOTIFY_CHILD );
             subscribeToDataChangeWatcher( MASTER_REBOUND_CHILD );
+            subscribeToChildrenChangeWatcher( HA_SERVERS_CHILD );
             return created.substring( created.lastIndexOf( "_" ) + 1 );
         }
         catch ( KeeperException e )
@@ -488,10 +525,10 @@ public class ZooClient extends AbstractZooKeeperManager
     private void writeHaServerConfig() throws InterruptedException, KeeperException
     {
         // Make sure the HA server root is created
-        String path = rootPath + "/" + HA_SERVERS_CHILD;
+        String serverRootPath = rootPath + "/" + HA_SERVERS_CHILD;
         try
         {
-            zooKeeper.create( path, new byte[0],
+            zooKeeper.create( serverRootPath, new byte[0],
                     ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT );
         }
         catch ( KeeperException e )
@@ -502,13 +539,32 @@ public class ZooClient extends AbstractZooKeeperManager
             }
         }
 
-        // Write the HA server config.
-        String machinePath = path + "/" + machineId;
-        byte[] data = haServerAsData();
+        // Make sure the compatibility node is present
+        String compatibilityPath = rootPath + "/" + COMPATIBILITY_CHILD;
         try
         {
-            zooKeeper.create( machinePath, data,
-                    ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL );
+            zooKeeper.create( compatibilityPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT );
+        }
+        catch ( KeeperException e )
+        {
+            if ( e.code() != KeeperException.Code.NODEEXISTS )
+            {
+                throw e;
+            }
+        }
+
+        // Write the HA server config.
+        String machinePath = serverRootPath + "/" + machineId;
+        String compatibilityMachinePath = compatibilityPath + "/" + machineId;
+        byte[] data = haServerAsData();
+        boolean compatCreated = false;
+        boolean machineCreated = false;
+        try
+        {
+            zooKeeper.create( compatibilityMachinePath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL );
+            compatCreated = true;
+            zooKeeper.create( machinePath, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL );
+            machineCreated = true;
         }
         catch ( KeeperException e )
         {
@@ -519,13 +575,14 @@ public class ZooClient extends AbstractZooKeeperManager
             msgLog.logMessage( "HA server info already present, trying again" );
             try
             {
-                zooKeeper.delete( machinePath, -1 );
+                if ( compatCreated ) zooKeeper.delete( compatibilityMachinePath, -1 );
+                if ( machineCreated ) zooKeeper.delete( machinePath, -1 );
             }
             catch ( KeeperException ee )
             {
                 if ( ee.code() != KeeperException.Code.NONODE )
                 {
-                    msgLog.logMessage( "Unable to delete " + machinePath, ee );
+                    msgLog.logMessage( "Unable to delete " + ee.getPath(), ee );
                 }
             }
             finally
@@ -648,33 +705,44 @@ public class ZooClient extends AbstractZooKeeperManager
 
     private void startFlushing()
     {
-        if ( !flushing )
+        if ( checkCompatibilityMode() )
+        {
+            msgLog.logMessage( "Discovered compatibility node, will remain in compatibility mode until the node is removed" );
+            updater = new CompatibilitySlaveOnlyTxIdUpdater();
+            updater.init();
+        }
+        else if ( !flushing )
         {
             synchronized ( this )
             {
-                /*
-                 * This is here so we call getFirstMasterForTx() on the same
-                 * txid that we post - not strictly required since setCommitedTxId()
-                 * is synchronized, which means we can't have committedTx changed while
-                 * we are here.
-                 */
-                long txNow = committedTx;
-                flushing = true;
-                writeData( txNow, getFirstMasterForTx( txNow ) );
-                msgLog.logMessage( "Starting flushing of txids to zk, while at txid " + txNow );
+                if ( !flushing )
+                {
+                    flushing = true;
+                    updater = new SynchronousTxIdUpdater();
+                    updater.init();
+                }
             }
         }
     }
 
     private void stopFlushing()
     {
-        if ( flushing )
+        if ( checkCompatibilityMode() )
+        {
+            msgLog.logMessage( "Discovered compatibility node, will remain in compatibility mode until the node is removed" );
+            updater = new CompatibilitySlaveOnlyTxIdUpdater();
+            updater.init();
+        }
+        else if ( flushing )
         {
             synchronized ( this )
             {
-                flushing = false;
-                writeData( -2, -2 );
-                msgLog.logMessage( "Stopping flushing of txids to zk, while at txid " + committedTx );
+                if ( flushing )
+                {
+                    flushing = false;
+                    updater = new NoUpdateTxIdUpdater();
+                    updater.init();
+                }
             }
         }
     }
@@ -682,11 +750,7 @@ public class ZooClient extends AbstractZooKeeperManager
     public synchronized void setCommittedTx( long tx )
     {
         this.committedTx = tx;
-        if ( flushing )
-        {
-            masterForCommittedTx = localDatabase.getMasterForTx( tx );
-            writeData( tx, masterForCommittedTx );
-        }
+        updater.updatedTxId( tx );
     }
 
     private void writeData( long tx, int masterForThat )
@@ -744,7 +808,15 @@ public class ZooClient extends AbstractZooKeeperManager
         watcher.shutdown();
         msgLog.close();
         this.shutdown = true;
+        shutdownSlaves();
         super.shutdown();
+    }
+
+    private void shutdownSlaves()
+    {
+        for ( Pair<SlaveClient,Machine> slave : cachedSlaves.values() )
+            slave.first().shutdown();
+        cachedSlaves.clear();
     }
 
     public boolean isShutdown()
@@ -760,9 +832,29 @@ public class ZooClient extends AbstractZooKeeperManager
     }
 
     @Override
-    protected String getHaServer( int machineId, boolean wait )
+    protected Machine getHaServer( int machineId, boolean wait )
     {
-        return machineId == this.machineId ? haServer : super.getHaServer( machineId, wait );
+        return machineId == this.machineId ? asMachine : super.getHaServer( machineId, wait );
+    }
+
+    private boolean checkCompatibilityMode()
+    {
+        try
+        {
+            refreshHaServers();
+            int totalCount = getNumberOfServers();
+            int myVersionCount = zooKeeper.getChildren( getRoot() + "/" + COMPATIBILITY_CHILD, false ).size();
+            boolean result = myVersionCount <= totalCount - 1;
+            msgLog.logMessage( "Checking compatibility mode, read " + totalCount + " as all machines, "
+                               + myVersionCount + " as myVersion machines. Based on that I return " + result );
+            return result;
+
+        }
+        catch ( Exception e )
+        {
+            msgLog.logMessage( "Tried to discover if we are in compatibility mode, got this exception instead", e );
+            throw new RuntimeException( e );
+        }
     }
 
     private synchronized StoreId createCluster( StoreId storeIdSuggestion )
@@ -890,6 +982,10 @@ public class ZooClient extends AbstractZooKeeperManager
 
         private synchronized void runEventInThread( final WatchedEvent event, final ZooKeeper zoo )
         {
+            if ( shutdown )
+            {
+                return;
+            }
             if ( count.get() > 10 )
             {
                 msgLog.logMessage( "Thread count is already at " + count.get()
@@ -939,6 +1035,11 @@ public class ZooClient extends AbstractZooKeeperManager
                             subscribeToDataChangeWatcher( MASTER_REBOUND_CHILD );
                         }
                         keeperState = KeeperState.SyncConnected;
+                        if ( checkCompatibilityMode() )
+                        {
+                            msgLog.logMessage( "Discovered compatibility node, will remain in compatibility mode until the node is removed" );
+                            updater = new CompatibilitySlaveOnlyTxIdUpdater();
+                        }
                     }
                     else
                     {
@@ -961,6 +1062,22 @@ public class ZooClient extends AbstractZooKeeperManager
                                         "NodeDeleted event received (a machine left the cluster)" ) );
                     }
                 }
+                else if ( event.getType() == Watcher.Event.EventType.NodeChildrenChanged )
+                {
+                    if ( path.endsWith( HA_SERVERS_CHILD ) )
+                    {
+                        try
+                        {
+                            refreshHaServers();
+                            serversRefreshed = true;
+                            subscribeToChildrenChangeWatcher( HA_SERVERS_CHILD );
+                        }
+                        catch ( ZooKeeperException e )
+                        {
+                            // Happens for session expiration, why?
+                        }
+                    }
+                }
                 else if ( event.getType() == Watcher.Event.EventType.NodeDataChanged )
                 {
                     int updatedData = toInt( getZooKeeper( true ).getData( path, true, null ) );
@@ -977,6 +1094,7 @@ public class ZooClient extends AbstractZooKeeperManager
                                 electionHappening = true;
                                 clusterReceiver.newMaster( new InformativeStackTrace(
                                         "NodeDataChanged event received (someone though I should be the master)" ) );
+                                serversRefreshed = true;
                             }
                             finally
                             {
@@ -996,6 +1114,7 @@ public class ZooClient extends AbstractZooKeeperManager
                                 electionHappening = true;
                                 clusterReceiver.newMaster( new InformativeStackTrace(
                                         "NodeDataChanged event received (new master ensures I'm slave)" ) );
+                                serversRefreshed = true;
                             }
                             finally
                             {
@@ -1034,6 +1153,124 @@ public class ZooClient extends AbstractZooKeeperManager
                 msgLog.flush();
                 count.decrementAndGet();
             }
+        }
+    }
+
+    private abstract class AbstractTxIdUpdater implements TxIdUpdater
+    {
+        @Override
+        public void updatedTxId( long txId )
+        {
+            // default no op
+        }
+    }
+
+    private class SynchronousTxIdUpdater extends AbstractTxIdUpdater
+    {
+        public void init()
+        {
+            /*
+             * this is safe because we call getFirstMasterForTx() on the same
+             * txid that we post - and we are supposed to be called from setCommitedTxId()
+             * which is synchronized, which means we can't have committedTx changed while
+             * we are here.
+             */
+            writeData( committedTx, getFirstMasterForTx( committedTx ) );
+            msgLog.logMessage( "Starting flushing of txids to zk, while at txid " + committedTx );
+        }
+
+        @Override
+        public void updatedTxId( long txId )
+        {
+            masterForCommittedTx = localDatabase.getMasterForTx( txId );
+            writeData( txId, masterForCommittedTx );
+        }
+    }
+
+    private class NoUpdateTxIdUpdater extends AbstractTxIdUpdater
+    {
+        @Override
+        public void init()
+        {
+            writeData( -2, -2 );
+            msgLog.logMessage( "Stopping flushing of txids to zk, while at txid " + committedTx );
+        }
+    }
+
+    private class CompatibilitySlaveOnlyTxIdUpdater extends AbstractTxIdUpdater
+    {
+        public void init()
+        {
+            writeData( 0, -1 );
+            msgLog.logMessage( "Set to defaults (0 for txid, -1 for master) since we are running in compatilibility mode, while at txid "
+                               + committedTx );
+        }
+    }
+
+    @Override
+    protected void invalidateMaster()
+    {
+        super.invalidateMaster();
+        serversRefreshed = true;
+    }
+
+    public Slave[] getSlavesFromZooKeeper()
+    {
+        synchronized ( cachedSlaves )
+        {
+            if ( serversRefreshed || cachedSlaves.isEmpty() )
+            {
+                // Go through the cached list and refresh where needed
+                Machine master = cachedMaster.other();
+                if ( master.getMachineId() == this.machineId )
+                {   // I'm the master, update/populate the slave list
+                    Set<Integer> visitedSlaves = new HashSet<Integer>();
+                    for ( Machine machine : getHaServers() )
+                    {
+                        int id = machine.getMachineId();
+                        visitedSlaves.add( id );
+                        if ( id == machineId )
+                            continue;
+
+                        boolean instantiate = true;
+                        Pair<SlaveClient, Machine> existingSlave = cachedSlaves.get( id );
+                        if ( existingSlave != null )
+                        {   // We already have a cached slave for this machine, check if
+                            // it's the same server information
+                            Machine existingMachine = existingSlave.other();
+                            if ( existingMachine.getServer().equals( machine.getServer() ) )
+                                instantiate = false;
+                            else
+                                // Connection information changed, needs refresh
+                                existingSlave.first().shutdown();
+                        }
+
+                        if ( instantiate )
+                        {
+                            cachedSlaves.put( id, Pair.of( new SlaveClient( machine.getMachineId(), machine.getServer().first(),
+                                    machine.getServer().other().intValue(), msgLog, storeId,
+                                    conf.get( HaSettings.max_concurrent_channels_per_slave ) ),
+                                    machine ) );
+                        }
+                    }
+
+                    Integer[] existingSlaves = cachedSlaves.keySet().toArray( new Integer[cachedSlaves.size()] );
+                    for ( int id : existingSlaves )
+                        if ( !visitedSlaves.contains( id ) )
+                            cachedSlaves.remove( id ).first().shutdown();
+                }
+                else
+                {   // I'm a slave, I don't need a slave list so clear any existing
+                    shutdownSlaves();
+                }
+                serversRefreshed = true;
+            }
+
+            Slave[] slaves = new Slave[cachedSlaves.size()];
+            int i = 0;
+            for ( Pair<SlaveClient, Machine> slave : cachedSlaves.values() )
+                slaves[i++] = slave.first();
+            return slaves;
         }
     }
 }

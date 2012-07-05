@@ -26,7 +26,9 @@ import static org.neo4j.com.Protocol.writeString;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -43,7 +45,7 @@ import org.jboss.netty.channel.ChannelPipelineFactory;
 import org.jboss.netty.channel.Channels;
 import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
 import org.jboss.netty.handler.queue.BlockingReadHandler;
-import org.neo4j.com.SlaveContext.Tx;
+import org.neo4j.com.RequestContext.Tx;
 import org.neo4j.helpers.Exceptions;
 import org.neo4j.helpers.Triplet;
 import org.neo4j.kernel.impl.nioneo.store.StoreId;
@@ -54,12 +56,12 @@ import org.neo4j.kernel.impl.util.StringLogger;
  * serializes requests and sends them to the server and waits for
  * a response back.
  */
-public abstract class Client<M> implements ChannelPipelineFactory
+public abstract class Client<T> implements ChannelPipelineFactory
 {
     // Max number of concurrent channels that may exist. Needs to be high because we
     // don't want to run into that limit, it will make some #acquire calls block and
     // gets disastrous if that thread is holding monitors that is needed to communicate
-    // with the master in some way.
+    // with the server in some way.
     public static final int DEFAULT_MAX_NUMBER_OF_CONCURRENT_CHANNELS_PER_CLIENT = 20;
     public static final int DEFAULT_READ_RESPONSE_TIMEOUT_SECONDS = 20;
 
@@ -73,6 +75,7 @@ public abstract class Client<M> implements ChannelPipelineFactory
     private final byte applicationProtocolVersion;
     private final StoreId storeId;
     private final ResourceReleaser resourcePoolReleaser;
+    private final List<MismatchingVersionHandler> mismatchingVersionHandlers;
 
     public Client( String hostNameOrIp, int port, StringLogger logger,
             StoreId storeId, int frameLength, byte applicationProtocolVersion, int readTimeout,
@@ -94,6 +97,7 @@ public abstract class Client<M> implements ChannelPipelineFactory
         this.frameLength = frameLength;
         this.applicationProtocolVersion = applicationProtocolVersion;
         this.readTimeout = readTimeout;
+        this.mismatchingVersionHandlers = new ArrayList<MismatchingVersionHandler>( 2 );
         channelPool = new ResourcePool<Triplet<Channel, ChannelBuffer, ByteBuffer>>(
                 maxConcurrentChannels, maxUnusedPoolSize )
         {
@@ -172,13 +176,13 @@ public abstract class Client<M> implements ChannelPipelineFactory
         return Server.INTERNAL_PROTOCOL_VERSION;
     }
 
-    protected <R> Response<R> sendRequest( RequestType<M> type, SlaveContext context,
+    protected <R> Response<R> sendRequest( RequestType<T> type, RequestContext context,
             Serializer serializer, Deserializer<R> deserializer )
     {
         return sendRequest( type, context, serializer, deserializer, null );
     }
 
-    protected <R> Response<R> sendRequest( RequestType<M> type, SlaveContext context,
+    protected <R> Response<R> sendRequest( RequestType<T> type, RequestContext context,
             Serializer serializer, Deserializer<R> deserializer, StoreId specificStoreId )
     {
         boolean success = true;
@@ -216,6 +220,15 @@ public abstract class Client<M> implements ChannelPipelineFactory
             return new Response<R>( response, storeId, txStreams,
                     resourcePoolReleaser );
         }
+        catch ( IllegalProtocolVersionException e )
+        {
+            success = false;
+            for ( MismatchingVersionHandler handler : mismatchingVersionHandlers )
+            {
+                handler.versionMismatched( e.getExpected(), e.getReceived() );
+            }
+            throw e;
+        }
         catch ( Throwable e )
         {
             success = false;
@@ -237,16 +250,16 @@ public abstract class Client<M> implements ChannelPipelineFactory
         }
     }
 
-    protected int getReadTimeout( RequestType<M> type, int readTimeout )
+    protected int getReadTimeout( RequestType<T> type, int readTimeout )
     {
         return readTimeout;
     }
 
-    protected boolean shouldCheckStoreId( RequestType<M> type )
+    protected boolean shouldCheckStoreId( RequestType<T> type )
     {
         return true;
     }
-    
+
     protected StoreId getStoreId()
     {
         return storeId;
@@ -269,7 +282,7 @@ public abstract class Client<M> implements ChannelPipelineFactory
         return StoreId.deserialize( byteBuffer );
     }
 
-    protected void writeContext( RequestType<M> type, SlaveContext context, ChannelBuffer targetBuffer )
+    protected void writeContext( RequestType<T> type, RequestContext context, ChannelBuffer targetBuffer )
     {
         targetBuffer.writeLong( context.getSessionId() );
         targetBuffer.writeInt( context.machineId() );
@@ -285,11 +298,11 @@ public abstract class Client<M> implements ChannelPipelineFactory
         targetBuffer.writeLong( context.getChecksum() );
     }
 
-    private Triplet<Channel, ChannelBuffer, ByteBuffer> getChannel( RequestType<M> type ) throws Exception
+    private Triplet<Channel, ChannelBuffer, ByteBuffer> getChannel( RequestType<T> type ) throws Exception
     {
         // Calling acquire is dangerous since it may be a blocking call... and if this
         // thread holds a lock which others may want to be able to communicate with
-        // the master things go stiff.
+        // the server things go stiff.
         Triplet<Channel, ChannelBuffer, ByteBuffer> result = channelPool.acquire();
         if ( result == null )
         {
@@ -299,7 +312,7 @@ public abstract class Client<M> implements ChannelPipelineFactory
         return result;
     }
 
-    protected void releaseChannel( RequestType<M> type, Triplet<Channel, ChannelBuffer, ByteBuffer> channel )
+    protected void releaseChannel( RequestType<T> type, Triplet<Channel, ChannelBuffer, ByteBuffer> channel )
     {
         channelPool.release();
     }
@@ -323,6 +336,7 @@ public abstract class Client<M> implements ChannelPipelineFactory
     {
         channelPool.close( true );
         executor.shutdownNow();
+        mismatchingVersionHandlers.clear();
         msgLog.logMessage( toString() + " shutdown", true );
     }
 
@@ -398,16 +412,8 @@ public abstract class Client<M> implements ChannelPipelineFactory
         }
     }
 
-    public interface ConnectionLostHandler
+    public void addMismatchingVersionHandler( MismatchingVersionHandler toAdd )
     {
-        public static final ConnectionLostHandler NO_ACTION = new ConnectionLostHandler()
-        {
-
-            @Override
-            public void handle( Exception e )
-            {
-            }
-        };
-        void handle( Exception e );
+        mismatchingVersionHandlers.add( toAdd );
     }
 }

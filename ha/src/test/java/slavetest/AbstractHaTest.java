@@ -54,6 +54,7 @@ import org.neo4j.helpers.collection.IterableWrapper;
 import org.neo4j.helpers.collection.IteratorUtil;
 import org.neo4j.helpers.collection.MapUtil;
 import org.neo4j.kernel.EmbeddedGraphDatabase;
+import org.neo4j.kernel.GraphDatabaseAPI;
 import org.neo4j.kernel.ha.HaSettings;
 import org.neo4j.kernel.impl.transaction.xaframework.InMemoryLogBuffer;
 import org.neo4j.kernel.impl.transaction.xaframework.LogExtractor;
@@ -355,7 +356,7 @@ public abstract class AbstractHaTest
 
     protected abstract int addDb( Map<String, String> config, boolean awaitStarted ) throws Exception;
 
-    protected abstract void startDb( int machineId, Map<String, String> config, boolean awaitStarted ) throws Exception;
+    protected abstract GraphDatabaseAPI startDb( int machineId, Map<String, String> config, boolean awaitStarted ) throws Exception;
 
     protected abstract void pullUpdates( int... slaves ) throws Exception;
 
@@ -374,7 +375,7 @@ public abstract class AbstractHaTest
     protected abstract Fetcher<DoubleLatch> getDoubleLatch() throws Exception;
 
     protected abstract void createBigMasterStore( int numberOfMegabytes );
-    
+
     private class Worker extends Thread
     {
         private boolean successfull;
@@ -536,22 +537,22 @@ public abstract class AbstractHaTest
         assertTrue( case1 || case2  );
         pullUpdates();
     }
-    
+
     @Test
     public void deadlockDetectionOnGraphPropertiesIsEnforced() throws Exception
     {
         initializeDbs( 2 );
-        
+
         Long[] nodes = executeJobOnMaster( new CommonJobs.CreateNodesJob( 1 ) );
         pullUpdates();
-        
+
         String key = "test.config";
         String value = "test value";
         executeJob( new CommonJobs.SetGraphPropertyJob( key, value ), 0 );
         assertEquals( value, executeJobOnMaster( new CommonJobs.GetGraphProperty( key ) ) );
         pullUpdates( 1 );
         assertEquals( value, executeJob( new CommonJobs.GetGraphProperty( key ), 1 ) );
-        
+
         Fetcher<DoubleLatch> fetcher = getDoubleLatch();
         Worker w1 = new Worker( 0, new CommonJobs.SetGraphProperty1( nodes[0], fetcher ) );
         Worker w2 = new Worker( 1, new CommonJobs.SetGraphProperty2( nodes[0], fetcher ) );
@@ -565,7 +566,7 @@ public abstract class AbstractHaTest
         assertTrue( case1 || case2  );
         pullUpdates();
     }
-    
+
     @Test
     public void createNodeAndIndex() throws Exception
     {
@@ -585,7 +586,7 @@ public abstract class AbstractHaTest
                 new String[] { "value1", "value2" }, "key 2", 105.43f ) ), 1 );
         pullUpdates();
     }
-    
+
     @Ignore( "Not suitable for a unit test, rely on HA Cronies to test this" )
     @Test
     public void testLargeTransaction() throws Exception
@@ -647,7 +648,7 @@ public abstract class AbstractHaTest
         int slaveId = addDb( MapUtil.stringMap(), true );
         awaitAllStarted();
         shutdownDb( slaveId );
-        
+
         // Assert that there are all neostore logical logs in the copy.
         File slavePath = dbPath( slaveId );
         EmbeddedGraphDatabase slaveDb = new EmbeddedGraphDatabase( slavePath.getAbsolutePath() );
@@ -661,10 +662,10 @@ public abstract class AbstractHaTest
         }
         extractor.close();
         slaveDb.shutdown();
-        
+
         startDb( slaveId, MapUtil.stringMap(), true );
     }
-    
+
     @Test
     public void makeSurePullIntervalWorks() throws Exception
     {
@@ -680,7 +681,7 @@ public abstract class AbstractHaTest
         }
         assertTrue( found );
     }
-    
+
     @Test
     public void testChannelResourcePool() throws Exception
     {
@@ -731,7 +732,7 @@ public abstract class AbstractHaTest
         jobShouldNotBlock.finish();
         jobShouldNotBlock.join();
     }
-    
+
     @Ignore( "Exposes a weakness in HA protocol where locks cannot be released individually," +
     		"but instead are always released when the transaction finishes" )
     @Test
@@ -748,17 +749,26 @@ public abstract class AbstractHaTest
         pullUpdates();
     }
     
+    @Test
+    public void commitAtMasterAlsoCommittsAtSlave() throws Exception
+    {
+        initializeDbs( 1 );
+        
+        long node = executeJobOnMaster( new CommonJobs.CreateNodeJob( true ) );
+        assertTrue( executeJob( new CommonJobs.GetNodeByIdJob( node ), 0 ) );
+    }
+    
     static class WorkerThread extends Thread
     {
         private final AbstractHaTest testCase;
         private volatile boolean keepRunning = true;
         private volatile boolean nodeCreatedOnTx = false;
-        
+
         WorkerThread( AbstractHaTest testCase )
         {
             this.testCase = testCase;
         }
-        
+
         @Override
         public void run()
         {
@@ -789,18 +799,18 @@ public abstract class AbstractHaTest
             }
             job.rollback();
         }
-        
+
         void finish()
         {
             keepRunning = false;
         }
-        
+
         boolean nodeHasBeenCreatedOnTx()
         {
             return nodeCreatedOnTx;
         }
     }
-    
+
     protected void disableVerificationAfterTest()
     {
         doVerificationAfterTest = false;

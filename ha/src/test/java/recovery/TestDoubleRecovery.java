@@ -20,12 +20,17 @@
 
 package recovery;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+
 import javax.transaction.xa.Xid;
+
 import org.junit.Ignore;
 import org.junit.Test;
 import org.neo4j.backup.OnlineBackup;
@@ -38,7 +43,7 @@ import org.neo4j.graphdb.index.Index;
 import org.neo4j.helpers.UTF8;
 import org.neo4j.helpers.collection.MapUtil;
 import org.neo4j.index.impl.lucene.LuceneDataSource;
-import org.neo4j.kernel.AbstractGraphDatabase;
+import org.neo4j.kernel.InternalAbstractGraphDatabase;
 import org.neo4j.kernel.DefaultFileSystemAbstraction;
 import org.neo4j.kernel.EmbeddedGraphDatabase;
 import org.neo4j.kernel.GraphDatabaseAPI;
@@ -52,8 +57,6 @@ import org.neo4j.test.subprocess.BreakPoint;
 import org.neo4j.test.subprocess.DebugInterface;
 import org.neo4j.test.subprocess.DebuggedThread;
 import org.neo4j.test.subprocess.KillSubProcess;
-
-import static org.junit.Assert.*;
 
 @SuppressWarnings( "serial" )
 public class TestDoubleRecovery extends AbstractSubProcessTestBase
@@ -185,7 +188,7 @@ public class TestDoubleRecovery extends AbstractSubProcessTestBase
         }
     }
 
-    private final BreakPoint ON_CRASH = new BreakPoint( Crash.class, "run", AbstractGraphDatabase.class )
+    private final BreakPoint ON_CRASH = new BreakPoint( Crash.class, "run", InternalAbstractGraphDatabase.class )
     {
         @Override
         protected void callback( DebugInterface debug ) throws KillSubProcess

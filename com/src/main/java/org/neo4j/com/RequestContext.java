@@ -27,41 +27,43 @@ import java.util.Arrays;
  * datasource</li> <li>an event identifier, the txid of the most recent local
  * top level tx</li> <li>a session id, the startup time of the database</li>
  */
-public final class SlaveContext
+public final class RequestContext
 {
+
     public static class Tx
     {
         private final String dataSourceName;
         private final long txId;
-        
+
         private Tx( String dataSourceName, long txId )
         {
             this.dataSourceName = dataSourceName;
             this.txId = txId;
         }
-        
+
         public String getDataSourceName()
         {
             return dataSourceName;
         }
-        
+
         public long getTxId()
         {
             return txId;
         }
-        
+
         @Override
         public String toString()
         {
             return dataSourceName + "/" + txId;
         }
+
     }
-    
+
     public static Tx lastAppliedTx( String dataSourceName, long txId )
     {
         return new Tx( dataSourceName, txId );
     }
-    
+
     private final int machineId;
     private final Tx[] lastAppliedTransactions;
     private final int eventIdentifier;
@@ -70,7 +72,7 @@ public final class SlaveContext
     private final int masterId;
     private final long checksum;
 
-    public SlaveContext( long sessionId, int machineId, int eventIdentifier,
+    public RequestContext( long sessionId, int machineId, int eventIdentifier,
             Tx[] lastAppliedTransactions, int masterId, long checksum )
     {
         this.sessionId = sessionId;
@@ -81,9 +83,9 @@ public final class SlaveContext
         this.checksum = checksum;
 
         long hash = sessionId;
-        hash = (31 * hash) ^ eventIdentifier;
-        hash = (31 * hash) ^ machineId;
-        this.hashCode = (int) ((hash >>> 32) ^ hash);
+        hash = ( 31 * hash ) ^ eventIdentifier;
+        hash = ( 31 * hash ) ^ machineId;
+        this.hashCode = (int) ( ( hash >>> 32 ) ^ hash );
     }
 
     public int machineId()
@@ -105,12 +107,12 @@ public final class SlaveContext
     {
         return sessionId;
     }
-    
+
     public int getMasterId()
     {
         return masterId;
     }
-    
+
     public long getChecksum()
     {
         return checksum;
@@ -119,18 +121,18 @@ public final class SlaveContext
     @Override
     public String toString()
     {
-        return "SlaveContext[session: " + sessionId + ", ID:" + machineId + ", eventIdentifier:" +
-                eventIdentifier + ", " + Arrays.asList( lastAppliedTransactions ) + "]";
+        return "SlaveContext[session: " + sessionId + ", ID:" + machineId + ", eventIdentifier:" + eventIdentifier
+               + ", " + Arrays.asList( lastAppliedTransactions ) + "]";
     }
 
     @Override
     public boolean equals( Object obj )
     {
-        if ( !( obj instanceof SlaveContext ) )
+        if ( !( obj instanceof RequestContext ) )
         {
             return false;
         }
-        SlaveContext o = (SlaveContext) obj;
+        RequestContext o = (RequestContext) obj;
         return o.eventIdentifier == eventIdentifier && o.machineId == machineId && o.sessionId == sessionId;
     }
 
@@ -140,11 +142,11 @@ public final class SlaveContext
         return this.hashCode;
     }
 
-    public static SlaveContext EMPTY = new SlaveContext( -1, -1, -1, new Tx[0], -1, -1 );
+    public static RequestContext EMPTY = new RequestContext( -1, -1, -1, new Tx[0], -1, -1 );
 
-    public static SlaveContext anonymous( Tx[] lastAppliedTransactions )
+    public static RequestContext anonymous( Tx[] lastAppliedTransactions )
     {
-        return new SlaveContext( EMPTY.sessionId, EMPTY.machineId, EMPTY.eventIdentifier,
+        return new RequestContext( EMPTY.sessionId, EMPTY.machineId, EMPTY.eventIdentifier,
                 lastAppliedTransactions, EMPTY.masterId, EMPTY.checksum );
     }
 }

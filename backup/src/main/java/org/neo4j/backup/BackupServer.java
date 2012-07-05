@@ -23,9 +23,9 @@ import org.jboss.netty.channel.Channel;
 import org.neo4j.backup.BackupClient.BackupRequestType;
 import org.neo4j.com.Client;
 import org.neo4j.com.Protocol;
+import org.neo4j.com.RequestContext;
 import org.neo4j.com.RequestType;
 import org.neo4j.com.Server;
-import org.neo4j.com.SlaveContext;
 import org.neo4j.com.TxChecksumVerifier;
 import org.neo4j.kernel.impl.util.StringLogger;
 
@@ -36,16 +36,16 @@ class BackupServer extends Server<TheBackupInterface, Object>
     static int DEFAULT_PORT = DEFAULT_BACKUP_PORT;
     static final int FRAME_LENGTH = Protocol.MEGA*4;
     
-    public BackupServer( TheBackupInterface realMaster, int port, StringLogger logger )
+    public BackupServer( TheBackupInterface requestTarget, int port, StringLogger logger )
     {
-        super( realMaster, port, logger, FRAME_LENGTH, PROTOCOL_VERSION,
+        super( requestTarget, port, logger, FRAME_LENGTH, PROTOCOL_VERSION,
                 DEFAULT_MAX_NUMBER_OF_CONCURRENT_TRANSACTIONS, Client.DEFAULT_READ_RESPONSE_TIMEOUT_SECONDS,
                 TxChecksumVerifier.ALWAYS_MATCH );
     }
 
     @Override
     protected void responseWritten( RequestType<TheBackupInterface> type, Channel channel,
-            SlaveContext context )
+            RequestContext context )
     {
     }
 
@@ -56,7 +56,7 @@ class BackupServer extends Server<TheBackupInterface, Object>
     }
 
     @Override
-    protected void finishOffChannel( Channel channel, SlaveContext context )
+    protected void finishOffChannel( Channel channel, RequestContext context )
     {
     }
 }

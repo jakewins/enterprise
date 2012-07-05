@@ -21,19 +21,20 @@ package org.neo4j.kernel.ha.zookeeper;
 
 import java.nio.ByteBuffer;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
-import org.neo4j.com.Client.ConnectionLostHandler;
 import org.neo4j.com.ComException;
+import org.neo4j.com.RequestContext;
 import org.neo4j.com.Response;
-import org.neo4j.com.SlaveContext;
 import org.neo4j.com.StoreWriter;
 import org.neo4j.com.TxExtractor;
 import org.neo4j.helpers.Pair;
@@ -41,7 +42,7 @@ import org.neo4j.kernel.IdType;
 import org.neo4j.kernel.ha.IdAllocation;
 import org.neo4j.kernel.ha.LockResult;
 import org.neo4j.kernel.ha.Master;
-import org.neo4j.kernel.ha.MasterClient;
+import org.neo4j.kernel.ha.MasterClientFactory;
 import org.neo4j.kernel.impl.nioneo.store.StoreId;
 import org.neo4j.kernel.impl.util.StringLogger;
 
@@ -53,31 +54,28 @@ public abstract class AbstractZooKeeperManager
 {
     protected static final String HA_SERVERS_CHILD = "ha-servers";
     protected static final String FLUSH_REQUESTED_CHILD = "flush-requested";
+    protected static final String COMPATIBILITY_CHILD = "compatibility-1.8";
 
     protected static final int STOP_FLUSHING = -6;
 
     private final String servers;
-    private final Map<Integer, String> haServersCache = Collections.synchronizedMap(
-            new HashMap<Integer, String>() );
+    private final Map<Integer, Machine> haServersCache = new ConcurrentHashMap<Integer, Machine>();
     protected volatile Pair<Master, Machine> cachedMaster = NO_MASTER_MACHINE_PAIR;
 
     protected final StringLogger msgLog;
-    protected final int maxConcurrentChannelsPerSlave;
-    protected final int clientReadTimeout;
-    protected final int clientLockReadTimeout;
     private final long sessionTimeout;
 
-    public AbstractZooKeeperManager( String servers, StringLogger msgLog,
-            int clientReadTimeout, int clientLockReadTimeout, int maxConcurrentChannelsPerSlave, int sessionTimeout )
+    private final MasterClientFactory masterClientFactory;
+
+    public AbstractZooKeeperManager( String servers, StringLogger msgLog, int sessionTimeout,
+            MasterClientFactory clientFactory )
     {
         assert msgLog != null;
 
         this.servers = servers;
         this.msgLog = msgLog;
-        this.clientLockReadTimeout = clientLockReadTimeout;
-        this.maxConcurrentChannelsPerSlave = maxConcurrentChannelsPerSlave;
-        this.clientReadTimeout = clientReadTimeout;
         this.sessionTimeout = sessionTimeout;
+        this.masterClientFactory = clientFactory;
     }
 
     protected String asRootPath( StoreId storeId )
@@ -191,10 +189,10 @@ public abstract class AbstractZooKeeperManager
         }
         return cachedMaster;
     }
-    
+
     protected StoreId getStoreId()
     {
-        // TODO
+        // By default return null, since by default we don't know of databases.
         return null;
     }
 
@@ -204,10 +202,9 @@ public abstract class AbstractZooKeeperManager
         {
             return NO_MASTER;
         }
-        return new MasterClient( master.getServer().first(),
-                master.getServer().other(), this.msgLog, getStoreId(),
-                ConnectionLostHandler.NO_ACTION, clientReadTimeout,
-                clientLockReadTimeout, maxConcurrentChannelsPerSlave );
+        return masterClientFactory.instantiate( master.getServer().first(),
+                master.getServer().other().intValue(),
+                getStoreId() );
     }
 
     protected abstract int getMyMachineId();
@@ -305,57 +302,59 @@ public abstract class AbstractZooKeeperManager
             }
 
             writeFlush( getMyMachineId() );
-            /*
-             * This is an optimization - we can go and check right away but we might get
-             * to the first machine before it manages to flush. So instead of going back
-             * and asking/trying again, we just wait a bit, makes the election finish faster
-             * on average.
-             */
-            Thread.sleep( 100 );
 
-            Map<Integer, ZooKeeperMachine> result = new HashMap<Integer, ZooKeeperMachine>();
-            String root = getRoot();
-            List<String> children = getZooKeeper( true ).getChildren( root, false );
-            for ( String child : children )
+            long endTime = System.currentTimeMillis()+sessionTimeout;
+OUTER:      do
             {
-                Pair<Integer, Integer> parsedChild = parseChild( child );
-                if ( parsedChild == null )
-                {
-                    continue;
-                }
+                Thread.sleep( 100 );
+                Map<Integer, ZooKeeperMachine> result = new HashMap<Integer, ZooKeeperMachine>();
 
-                try
+                String root = getRoot();
+                List<String> children = getZooKeeper( true ).getChildren( root, false );
+                for ( String child : children )
                 {
-                    int id = parsedChild.first();
-                    int seq = parsedChild.other();
-                    Pair<Long, Integer> instanceData = readDataRepresentingInstance( root + "/" + child );
-                    long lastCommittedTxId = instanceData.first();
-                    int masterId = instanceData.other();
-                    if ( id == getMyMachineId() && mySequenceNumber == -1 )
-                    {
+                    Pair<Integer, Integer> parsedChild = parseChild( child );
+                    if ( parsedChild == null )
+                    {   // This was some kind of other ZK node, just ignore
                         continue;
                     }
-                    if ( lastCommittedTxId == -2 )
+
+                    try
                     {
-                        msgLog.logMessage( "Couldn't read " + id + "_" + seq + ", retrying from scratch" );
-                        return null;
+                        int id = parsedChild.first();
+                        int seq = parsedChild.other();
+                        Pair<Long, Integer> instanceData = readDataRepresentingInstance( root + "/" + child );
+                        long lastCommittedTxId = instanceData.first();
+                        int masterId = instanceData.other();
+                        if ( id == getMyMachineId() && mySequenceNumber == -1 )
+                        {   // I'm not initialized yet
+                            continue;
+                        }
+                        if ( lastCommittedTxId == -2 )
+                        {   // This instances hasn't written its txId yet. Go out to
+                            // the outer loop and retry it again.
+                            continue OUTER;
+                        }
+                        if ( !result.containsKey( id ) || seq > result.get( id ).getSequenceId() )
+                        {   // This instance has written its data so I'll grab it.
+                            Machine haServer = getHaServer( id, wait );
+                            ZooKeeperMachine toAdd = new ZooKeeperMachine( id, seq, lastCommittedTxId, masterId,
+                                    haServer.getServerAsString(), haServer.getBackupPort(), HA_SERVERS_CHILD + "/" + id );
+                            result.put( id, toAdd );
+                        }
                     }
-                    if ( !result.containsKey( id ) || seq > result.get( id ).getSequenceId() )
+                    catch ( KeeperException inner )
                     {
-                        ZooKeeperMachine toAdd = new ZooKeeperMachine( id, seq, lastCommittedTxId, masterId,
-                                getHaServer( id, wait ), HA_SERVERS_CHILD + "/" + id );
-                        result.put( id, toAdd );
+                        if ( inner.code() != KeeperException.Code.NONODE )
+                        {
+                            throw new ZooKeeperException( "Unable to get master.", inner );
+                        }
                     }
                 }
-                catch ( KeeperException inner )
-                {
-                    if ( inner.code() != KeeperException.Code.NONODE )
-                    {
-                        throw new ZooKeeperException( "Unable to get master.", inner );
-                    }
-                }
+                return result;
             }
-            return result;
+            while ( System.currentTimeMillis() < endTime );
+            return null;
         }
         catch ( KeeperException e )
         {
@@ -372,18 +371,48 @@ public abstract class AbstractZooKeeperManager
         }
     }
 
-    protected String getHaServer( int machineId, boolean wait )
+    protected Machine getHaServer( int machineId, boolean wait )
     {
-        String result = haServersCache.get( machineId );
+        Machine result = haServersCache.get( machineId );
         if ( result == null )
         {
-            result = readHaServer( machineId, wait ).first();
+            result = readHaServer( machineId, wait );
             haServersCache.put( machineId, result );
         }
         return result;
     }
 
-    protected Pair<String /*Host and port*/, Integer /*backup port*/> readHaServer( int machineId, boolean wait )
+    protected void refreshHaServers() throws KeeperException
+    {
+        try
+        {
+            Set<Integer> visitedChildren = new HashSet<Integer>();
+            for ( String child : getZooKeeper( true ).getChildren( getRoot() + "/" + HA_SERVERS_CHILD, false ) )
+            {
+                int id = idFromPath( child );
+                haServersCache.put( id, readHaServer( id, false ) );
+                visitedChildren.add( id );
+            }
+            haServersCache.keySet().retainAll( visitedChildren );
+        }
+        catch ( InterruptedException e )
+        {
+            Thread.interrupted();
+            throw new ZooKeeperException( "Interrupted", e );
+        }
+    }
+
+    protected Iterable<Machine> getHaServers()
+    {
+        return haServersCache.values();
+    }
+
+    protected int getNumberOfServers()
+    {
+        return haServersCache.size();
+    }
+
+    protected Machine readHaServer( int machineId, boolean wait )
     {
         if ( wait )
         {
@@ -402,7 +431,7 @@ public abstract class AbstractZooKeeperManager
             String result = String.valueOf( chars );
             log( "Read HA server:" + result + " (for machineID " + machineId +
                     ") from zoo keeper" );
-            return Pair.of( result, backupPort );
+            return new Machine( machineId, 0, 0, 0, result, backupPort );
         }
         catch ( KeeperException e )
         {
@@ -518,6 +547,11 @@ public abstract class AbstractZooKeeperManager
         return servers;
     }
 
+    protected int idFromPath( String path )
+    {
+        return Integer.parseInt( path.substring( path.lastIndexOf( '/' )+1 ) );
+    }
+
     private void writeFlush( int toWrite )
     {
         final String path = getRoot() + "/" + FLUSH_REQUESTED_CHILD;
@@ -585,7 +619,7 @@ public abstract class AbstractZooKeeperManager
         public void shutdown() {}
 
         @Override
-        public Response<Void> pullUpdates( SlaveContext context )
+        public Response<Void> pullUpdates( RequestContext context )
         {
             throw noMasterException();
         }
@@ -596,7 +630,7 @@ public abstract class AbstractZooKeeperManager
         }
 
         @Override
-        public Response<Void> initializeTx( SlaveContext context )
+        public Response<Void> initializeTx( RequestContext context )
         {
             throw noMasterException();
         }
@@ -608,32 +642,32 @@ public abstract class AbstractZooKeeperManager
         }
 
         @Override
-        public Response<Void> finishTransaction( SlaveContext context, boolean success )
+        public Response<Void> finishTransaction( RequestContext context, boolean success )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<Integer> createRelationshipType( SlaveContext context, String name )
+        public Response<Integer> createRelationshipType( RequestContext context, String name )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<Void> copyStore( SlaveContext context, StoreWriter writer )
+        public Response<Void> copyStore( RequestContext context, StoreWriter writer )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<Void> copyTransactions( SlaveContext context,
+        public Response<Void> copyTransactions( RequestContext context,
                 String dsName, long startTxId, long endTxId )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<Long> commitSingleResourceTransaction( SlaveContext context, String resource,
+        public Response<Long> commitSingleResourceTransaction( RequestContext context, String resource,
                 TxExtractor txGetter )
         {
             throw noMasterException();
@@ -646,51 +680,56 @@ public abstract class AbstractZooKeeperManager
         }
 
         @Override
-        public Response<LockResult> acquireRelationshipWriteLock( SlaveContext context,
+        public Response<LockResult> acquireRelationshipWriteLock( RequestContext context,
                 long... relationships )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireRelationshipReadLock( SlaveContext context,
+        public Response<LockResult> acquireRelationshipReadLock( RequestContext context,
                 long... relationships )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireNodeWriteLock( SlaveContext context, long... nodes )
+        public Response<LockResult> acquireNodeWriteLock( RequestContext context, long... nodes )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireNodeReadLock( SlaveContext context, long... nodes )
+        public Response<LockResult> acquireNodeReadLock( RequestContext context, long... nodes )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireGraphWriteLock( SlaveContext context )
+        public Response<LockResult> acquireGraphWriteLock( RequestContext context )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireGraphReadLock( SlaveContext context )
+        public Response<LockResult> acquireGraphReadLock( RequestContext context )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireIndexReadLock( SlaveContext context, String index, String key )
+        public Response<LockResult> acquireIndexReadLock( RequestContext context, String index, String key )
         {
             throw noMasterException();
         }
 
         @Override
-        public Response<LockResult> acquireIndexWriteLock( SlaveContext context, String index, String key )
+        public Response<LockResult> acquireIndexWriteLock( RequestContext context, String index, String key )
+        {
+            throw noMasterException();
+        }
+        
+        public Response<Void> pushTransaction( RequestContext context, String resourceName, long tx )
         {
             throw noMasterException();
         }
