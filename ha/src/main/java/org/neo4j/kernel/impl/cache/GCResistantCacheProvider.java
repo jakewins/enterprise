@@ -19,11 +19,11 @@
  */
 package org.neo4j.kernel.impl.cache;
 
-import static org.neo4j.graphdb.factory.GraphDatabaseSettings.gcr_cache_min_log_interval;
+import static org.neo4j.graphdb.factory.GraphDatabaseSettings.gcr_cache_log_interval;
 import static org.neo4j.graphdb.factory.GraphDatabaseSettings.node_cache_array_fraction;
-import static org.neo4j.graphdb.factory.GraphDatabaseSettings.node_cache_size;
+import static org.neo4j.graphdb.factory.GraphDatabaseSettings.gcr_node_cache_size;
 import static org.neo4j.graphdb.factory.GraphDatabaseSettings.relationship_cache_array_fraction;
-import static org.neo4j.graphdb.factory.GraphDatabaseSettings.relationship_cache_size;
+import static org.neo4j.graphdb.factory.GraphDatabaseSettings.gcr_relationship_cache_size;
 
 import org.neo4j.helpers.Service;
 import org.neo4j.kernel.configuration.Config;
@@ -44,20 +44,20 @@ public class GCResistantCacheProvider extends CacheProvider
     @Override
     public Cache<NodeImpl> newNodeCache( StringLogger logger, Config config )
     {
-        long node = config.get( node_cache_size );
-        long rel = config.get( relationship_cache_size );
+        long node = config.get( gcr_node_cache_size );
+        long rel = config.get( gcr_relationship_cache_size );
         checkMemToUse( logger, node, rel, Runtime.getRuntime().maxMemory() );
-        return new GCResistantCache<NodeImpl>( node, config.get( node_cache_array_fraction ), config.get( gcr_cache_min_log_interval ),
+        return new GCResistantCache<NodeImpl>( node, config.get( node_cache_array_fraction ), config.get( gcr_cache_log_interval ),
                 NODE_CACHE_NAME, logger );
     }
 
     @Override
     public Cache<RelationshipImpl> newRelationshipCache( StringLogger logger, Config config )
     {
-        long node = config.get( node_cache_size );
-        long rel = config.get( relationship_cache_size );
+        long node = config.get( gcr_node_cache_size );
+        long rel = config.get( gcr_relationship_cache_size );
         checkMemToUse( logger, node, rel, Runtime.getRuntime().maxMemory() );
-        return new GCResistantCache<RelationshipImpl>( rel, config.get( relationship_cache_array_fraction ), config.get( gcr_cache_min_log_interval ),
+        return new GCResistantCache<RelationshipImpl>( rel, config.get( relationship_cache_array_fraction ), config.get( gcr_cache_log_interval ),
                 RELATIONSHIP_CACHE_NAME, logger );
     }
 
