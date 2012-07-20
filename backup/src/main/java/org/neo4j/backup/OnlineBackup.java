@@ -213,9 +213,11 @@ public class OnlineBackup
             bumpLogFile( targetDirectory, timestamp );
             if ( verification )
             {
-                StoreFactory factory = new StoreFactory( new Config( new ConfigurationDefaults(GraphDatabaseSettings.class ).apply( stringMap() )), new DefaultIdGeneratorFactory(),
+                String storeFile = new File( targetDirectory, NeoStore.DEFAULT_NAME ).getAbsolutePath();
+                Map<String, String> config = stringMap(GraphDatabaseSettings.neo_store.name(), storeFile );
+                StoreFactory factory = new StoreFactory( new Config( new ConfigurationDefaults(GraphDatabaseSettings.class ).apply( config )), new DefaultIdGeneratorFactory(),
                         new DefaultFileSystemAbstraction(), new DefaultLastCommittedTxIdSetter(), SYSTEM, new DefaultTxHook() );
-                NeoStore neoStore = factory.newNeoStore( new File( targetDirectory, NeoStore.DEFAULT_NAME ).getAbsolutePath() );
+                NeoStore neoStore = factory.newNeoStore( );
                 try
                 {
                     StoreAccess store = new StoreAccess( neoStore );

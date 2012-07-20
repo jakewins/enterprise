@@ -67,9 +67,9 @@ public class MasterGraphDatabase
         return new StoreFactory(config, idGeneratorFactory, fileSystem, lastCommittedTxIdSetter, msgLog, txHook)
         {
             @Override
-            public NeoStore createNeoStore( String fileName )
+            public NeoStore createNeoStore()
             {
-                return super.createNeoStore( fileName, storeId );
+                return super.createNeoStore(storeId );
             }
         };
     }
