@@ -31,6 +31,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.ReadableByteChannel;
 import java.util.Collection;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -766,7 +767,11 @@ public class HighlyAvailableGraphDatabase
     {
         getMessageLog().logMessage( "Copying store from master" );
         String temp = getClearedTempDir().getAbsolutePath();
+
+        Date copyStart = new Date();
         Response<Void> response = master.first().copyStore( emptyContext(), new ToFileStoreWriter( temp ) );
+        getMessageLog().logMessage( "Time taken to copy store files: " + ((new Date().getTime() - copyStart.getTime()) / 1000.0) + "s" );
+
         long highestLogVersion = highestLogVersion( temp );
         if( highestLogVersion > -1 )
         {
@@ -781,7 +786,9 @@ public class HighlyAvailableGraphDatabase
 
         try
         {
+            Date applyTxStart = new Date( );
             ServerUtil.applyReceivedTransactions( response, copiedDb, ServerUtil.txHandlerForFullCopy() );
+            getMessageLog().logMessage( "Time taken to apply transactions: " + ((new Date().getTime() - applyTxStart.getTime()) / 1000.0) + "s" );
         }
         finally
         {

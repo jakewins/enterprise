@@ -460,8 +460,14 @@ public class MasterImpl implements Master
 
     public Response<Void> copyStore( RequestContext context, StoreWriter writer )
     {
+        long slaveId = context.machineId(); // Remember this, because we reassign context in a second
+        msgLog.logMessage( "Copying store to slave #" + slaveId );
+
         context = ServerUtil.rotateLogsAndStreamStoreFiles( graphDb, true, writer );
         writer.done();
+
+        msgLog.logMessage( "Done copying store to slave #" + slaveId );
+
         return packResponse( context, null );
     }
 

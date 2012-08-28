@@ -80,6 +80,24 @@ public class TestLogging
         
         assertMessagesLogContains( slaveDir, "STARTUP diagnostics" );
     }
+
+    @Test
+    public void makeSureAppropriateLoggingIsDoneOnStoreCopy() throws Exception
+    {
+        // When a cluster has been set up
+        slave.shutdown();
+        slave = null;
+        master.shutdown();
+        master = null;
+
+        // Then
+        assertMessagesLogContains( masterDir, "Copying store to slave #1" ); // Id from config in begin
+        assertMessagesLogContains( masterDir, "Done copying store to slave #1" ); // Id from config in begin
+
+        assertMessagesLogContains( slaveDir, "Time taken to copy store files: " );
+        assertMessagesLogContains( slaveDir, "Time taken to apply transactions: " );
+    }
+
     
     @Test
     public void makeSureMessagesAreLoggedAfterBrokerReconnect() throws Exception
@@ -91,12 +109,16 @@ public class TestLogging
         assertMessagesLogContains( slaveDir, "Rotating [" );
     }
     
-    private void assertMessagesLogContains( String slaveDir, String expectingToFind )
+    private void assertMessagesLogContains( String dbDir, String expectingToFind )
     {
         boolean found = false;
-        for ( String line : IteratorUtil.asIterable( new File( slaveDir, StringLogger.DEFAULT_NAME ) ) )
+        for ( String line : IteratorUtil.asIterable( new File( dbDir, StringLogger.DEFAULT_NAME ) ) )
+        {
             if ( line.contains( expectingToFind ) )
+            {
                 found = true;
+            }
+        }
         assertTrue( "Expected to find at least one log message including '" + expectingToFind + "' but didn't", found );
     }
 }
